@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>株式会社いい湯だな</title>
+<meta name="description" content="株式会社いい湯だな">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --night:#142120;        /* 夜の湯船 */
+    --night-2:#1c2c2a;
+    --cream:#f3ece0;
+    --gothic:"Zen Kaku Gothic New", "Hiragino Sans", sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:var(--night);overflow:hidden}
+
+  .hero{position:relative;height:100vh;height:100svh;overflow:hidden;
+    background:radial-gradient(ellipse 60% 55% at 50% 48%, #2a3a36 0%, var(--night-2) 45%, var(--night) 100%);
+    touch-action:none}
+  .hero__logo{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none}
+  .hero__logo img{height:min(62vh, 120vw);width:auto;display:block;
+    filter:blur(9px);opacity:.75}   /* 曇りガラス越しのぼやけたロゴ */
+  .hero canvas{position:absolute;inset:0;width:100%;height:100%;display:block;pointer-events:none}
+
+  /* WIPE：テキストだけ。difference合成で、曇り（明）でも拭った後（暗）でも読める */
+  .wipe{position:absolute;top:clamp(18px,3.2vw,38px);right:clamp(18px,3.4vw,44px);z-index:5;
+    font:500 14px/1 var(--gothic);letter-spacing:.42em;padding:8px 0 8px .42em;
+    color:#fff;mix-blend-mode:difference;background:none;border:0;cursor:pointer;
+    transition:opacity .3s, letter-spacing .4s}
+  .wipe:hover{letter-spacing:.5em}
+  .wipe:focus-visible{outline:1px solid #fff;outline-offset:6px}
+  .wipe[aria-busy="true"]{opacity:.45;cursor:default}
+  .sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+</style>
+</head>
+<body>
+
+<main class="hero">
+  <h1 class="sr">株式会社いい湯だな</h1>
+  <div class="hero__logo"><img src="assets/logo-vertical-light.svg" alt="株式会社いい湯だな"></div>
+  <canvas id="sharp" aria-hidden="true"></canvas>
+  <canvas id="fog" aria-hidden="true"></canvas>
+  <button class="wipe" id="wipeBtn" type="button" aria-label="湯気を拭う">WIPE</button>
+</main>
+
+<script>
+(() => {
+  const hero  = document.querySelector('.hero');
+  const fog   = document.getElementById('fog');
+  const btn   = document.getElementById('wipeBtn');
+  const sharp = document.getElementById('sharp');   // 拭った所だけ見える、くっきりしたロゴ
+  const sctx  = sharp.getContext('2d');
+  const logoImg = document.querySelector('.hero__logo img');
+  const sharpBuf = document.createElement('canvas');
+  const fctx  = fog.getContext('2d');
+  const mask  = document.createElement('canvas');   // 拭われ具合（alpha=1で完全にクリア）
+  const mctx  = mask.getContext('2d');
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  const FOG_RES = 0.34;          // 湯気は低解像度で描いて拡大 → 自然にボケる
+  const FOG_RGB = '236,239,236';
+  let W = 0, H = 0, fw = 0, fh = 0, dpr = 1;
+
+  const rand = (a, b) => a + Math.random() * (b - a);
+
+  /* ── 湯気のスプライト（ふわっとした不定形の雲）を数種類つくる ── */
+  function makePuff(size) {
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const g = c.getContext('2d');
+    for (let i = 0; i < 16; i++) {
+      const ang = Math.random() * Math.PI * 2;
+      const dist = Math.random() ** 1.4 * size * 0.26;
+      const x = size / 2 + Math.cos(ang) * dist;
+      const y = size / 2 + Math.sin(ang) * dist * 0.8;
+      const r = size * rand(0.12, 0.26);
+      const grd = g.createRadialGradient(x, y, 0, x, y, r);
+      const a = rand(0.18, 0.38);
+      grd.addColorStop(0, `rgba(${FOG_RGB},${a})`);
+      grd.addColorStop(0.55, `rgba(${FOG_RGB},${a * 0.45})`);
+      grd.addColorStop(1, `rgba(${FOG_RGB},0)`);
+      g.fillStyle = grd;
+      g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill();
+    }
+    return c;
+  }
+  const sprites = Array.from({ length: 6 }, () => makePuff(256));
+
+  /* ── タイル状につながる雲テクスチャ（ベースの霧＆曇り戻りのムラに使用） ── */
+  function makeCloudTile(size, blobs, aMin, aMax, rMin, rMax) {
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const g = c.getContext('2d');
+    for (let i = 0; i < blobs; i++) {
+      const x = Math.random() * size, y = Math.random() * size;
+      const r = size * rand(rMin, rMax), a = rand(aMin, aMax);
+      for (let ox = -1; ox <= 1; ox++) for (let oy = -1; oy <= 1; oy++) {
+        const cx = x + ox * size, cy = y + oy * size;
+        if (cx + r < 0 || cx - r > size || cy + r < 0 || cy - r > size) continue;
+        const grd = g.createRadialGradient(cx, cy, 0, cx, cy, r);
+        grd.addColorStop(0, `rgba(${FOG_RGB},${a})`);
+        grd.addColorStop(1, `rgba(${FOG_RGB},0)`);
+        g.fillStyle = grd;
+        g.fillRect(cx - r, cy - r, r * 2, r * 2);
+      }
+    }
+    return c;
+  }
+  const cloudTile = makeCloudTile(256, 60, 0.10, 0.34, 0.08, 0.22);
+  const erodeTile = makeCloudTile(128, 40, 0.2, 0.9, 0.06, 0.18);
+  // タイルの継ぎ目が出ないよう、パターンとして敷き詰める
+  const cloudPat = fctx.createPattern(cloudTile, 'repeat');
+  const erodePat = mctx.createPattern(erodeTile, 'repeat');
+  function fillPattern(ctx, pat, tileSrc, size, ox, oy, w, h) {
+    const s = size / tileSrc;
+    pat.setTransform(new DOMMatrix([s, 0, 0, s, ox, oy]));
+    ctx.fillStyle = pat;
+    ctx.fillRect(0, 0, w, h);
+  }
+
+  /* ── ぞうきんの跡：中心はしっかり、縁は拭きムラの筋が残るブラシ ── */
+  function makeRag(size) {
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const g = c.getContext('2d');
+    const m = size / 2;
+    const grd = g.createRadialGradient(m, m, 0, m, m, m);
+    grd.addColorStop(0, 'rgba(255,255,255,1)');
+    grd.addColorStop(0.55, 'rgba(255,255,255,.9)');
+    grd.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = grd;
+    g.fillRect(0, 0, size, size);
+    // 布目の筋（進行方向＝x軸に沿って、拭き残しの濃淡）
+    g.globalCompositeOperation = 'destination-out';
+    for (let i = 0; i < 40; i++) {
+      const y = rand(0, size), hgt = rand(0.6, size * 0.02);
+      const edge = Math.abs(y - m) / m;             // 縁ほど拭き残しが多い
+      g.fillStyle = `rgba(0,0,0,${rand(0.02, 0.08) + edge * edge * 0.3})`;
+      g.fillRect(0, y, size, hgt);
+    }
+    return c;
+  }
+  const rag = makeRag(128);
+
+  /* ── パーティクル（湯気の塊） ── */
+  let puffs = [];
+  function newPuff(anywhere) {
+    const base = Math.min(fw, fh);
+    const r = base * rand(0.16, 0.42);
+    const p = {
+      x: rand(-0.1, 1.1) * fw,
+      y: anywhere ? rand(-0.1, 1.1) * fh : fh + r * rand(0.1, 0.6),
+      vx: 0, vy: 0,
+      r,
+      rise: base * rand(0.035, 0.09),     // 立ちのぼる速さ
+      sway: base * rand(0.02, 0.06),      // ゆらゆら幅
+      freq: rand(0.25, 0.6), ph: rand(0, 6.28),
+      rot: rand(0, 6.28), spin: rand(-0.12, 0.12),
+      a: rand(0.55, 0.95),
+      age: 0, life: rand(9, 18),
+      sp: sprites[(Math.random() * sprites.length) | 0],
+    };
+    if (anywhere) p.age = rand(0, p.life * 0.8);
+    return p;
+  }
+
+  function resize() {
+    const r = hero.getBoundingClientRect();
+    W = r.width; H = r.height;
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    fw = Math.max(80, Math.round(W * FOG_RES));
+    fh = Math.max(80, Math.round(H * FOG_RES));
+    fog.width = fw; fog.height = fh;
+    // マスクは作り直すと拭った跡が消えるので、内容を引き継ぐ
+    const old = document.createElement('canvas');
+    old.width = mask.width || 1; old.height = mask.height || 1;
+    old.getContext('2d').drawImage(mask, 0, 0);
+    mask.width = fw; mask.height = fh;
+    mctx.drawImage(old, 0, 0, fw, fh);
+    sharp.width = Math.round(W * dpr); sharp.height = Math.round(H * dpr);
+    buildSharp();
+    const target = Math.round(Math.max(36, Math.min(110, (W * H) / 15000)));
+    while (puffs.length < target) puffs.push(newPuff(true));
+    puffs.length = target;
+  }
+
+  /* ── くっきり版の背景＋ロゴを事前に描いておく（CSSの見た目と同じ配置） ── */
+  function buildSharp() {
+    const w = sharp.width, h = sharp.height;
+    sharpBuf.width = w; sharpBuf.height = h;
+    const g = sharpBuf.getContext('2d');
+    const cs = getComputedStyle(document.documentElement);
+    const rx = w * 0.6, ry = h * 0.55, cx = w * 0.5, cy = h * 0.48;
+    g.save();
+    g.translate(cx, cy); g.scale(1, ry / rx);
+    const grd = g.createRadialGradient(0, 0, 0, 0, 0, rx);
+    grd.addColorStop(0, '#2a3a36');
+    grd.addColorStop(0.45, cs.getPropertyValue('--night-2').trim());
+    grd.addColorStop(1, cs.getPropertyValue('--night').trim());
+    g.fillStyle = grd;
+    g.fillRect(-cx, -cy / (ry / rx), w, h / (ry / rx));
+    g.restore();
+    if (logoImg.complete && logoImg.naturalWidth) {
+      const r = logoImg.getBoundingClientRect(), hr = hero.getBoundingClientRect();
+      g.drawImage(logoImg, (r.left - hr.left) * dpr, (r.top - hr.top) * dpr, r.width * dpr, r.height * dpr);
+    }
+  }
+  logoImg.addEventListener('load', buildSharp);
+
+  /* ── マウス（タッチ）に湯気がゆったり追従 ── */
+  const mouse = { x: -9999, y: -9999, vx: 0, vy: 0, lastT: 0, active: false };
+  function onMove(e) {
+    const r = hero.getBoundingClientRect();
+    const x = (e.clientX - r.left) * FOG_RES, y = (e.clientY - r.top) * FOG_RES;
+    const now = performance.now();
+    if (mouse.active) {
+      const dt = Math.max(8, now - mouse.lastT) / 1000;
+      const k = 0.25;
+      mouse.vx += (((x - mouse.x) / dt) - mouse.vx) * k;
+      mouse.vy += (((y - mouse.y) / dt) - mouse.vy) * k;
+    }
+    mouse.x = x; mouse.y = y; mouse.lastT = now; mouse.active = true;
+  }
+  hero.addEventListener('pointermove', onMove, { passive: true });
+  hero.addEventListener('pointerdown', onMove, { passive: true });
+  hero.addEventListener('pointerleave', () => { mouse.active = false; });
+
+  /* ── ぞうきん拭き：40°傾けたZの軌跡を、手で拭くようなムラのある動きでなぞる ── */
+  const TILT = -40 * Math.PI / 180;          // 右上がりに40°
+  const wipe = { on: false, t: 0, dur: 2.1, prev: null, endedAt: -1e9, pts: null, seed: 0 };
+
+  // Zの4頂点（左上→右上→左下→右下）を画面中心で回転させる。単位はfog解像度
+  function zPoints() {
+    const cx = fw / 2, cy = fh / 2;
+    const a = Math.min(fw * 0.42, fh * 0.42);   // 横棒の半分の長さ
+    const b = fh * 0.30;                         // 縦方向の半分
+    const raw = [[-a, -b], [a, -b], [-a, b], [a, b]];
+    const c = Math.cos(TILT), s = Math.sin(TILT);
+    return raw.map(([x, y]) => {
+      // 手拭きらしく頂点を少しずつずらす
+      x += rand(-0.06, 0.06) * a; y += rand(-0.06, 0.06) * b;
+      return { x: cx + x * c - y * s, y: cy + x * s + y * c };
+    });
+  }
+  // 1画ごとに「ぐっと加速→角で減速」。終わり際は少し行き過ぎる
+  const strokeEase = u => {
+    const e = u < 0.5 ? 2 * u * u : 1 - Math.pow(-2 * u + 2, 2) / 2;
+    return e + Math.sin(Math.PI * u) * 0.04;
+  };
+  // 3画の時間配分（斜めの画はやや長め）
+  const SEG = [0.30, 0.38, 0.32];
+  function ragPos(t) {
+    const P = wipe.pts;
+    let u = Math.min(1, t / wipe.dur), i = 0;
+    while (i < 2 && u > SEG[i]) { u -= SEG[i]; i++; }
+    const k = strokeEase(Math.min(1, u / SEG[i]));
+    const A = P[i], B = P[i + 1];
+    let x = A.x + (B.x - A.x) * k, y = A.y + (B.y - A.y) * k;
+    // 進行方向と直交するゆらぎ（手のブレ）
+    const dx = B.x - A.x, dy = B.y - A.y, L = Math.hypot(dx, dy) || 1;
+    const wob = Math.sin(t * 9 + wipe.seed) * 0.5 + Math.sin(t * 23 + wipe.seed * 2) * 0.25;
+    const amp = Math.min(fw, fh) * 0.018;
+    x += (-dy / L) * wob * amp; y += (dx / L) * wob * amp;
+    return { x, y, ang: Math.atan2(dy, dx) };
+  }
+  function startWipe() {
+    if (wipe.on) return;
+    wipe.on = true; wipe.t = 0; wipe.start = performance.now(); wipe.pts = zPoints(); wipe.seed = rand(0, 100);
+    wipe.prev = ragPos(0);
+    btn.setAttribute('aria-busy', 'true');
+  }
+  btn.addEventListener('click', startWipe);
+
+  function stampRag(from, to) {
+    const R = Math.max(Math.min(fw, fh) * 0.16, 22);      // ぞうきんの幅（半径）
+    const dist = Math.hypot(to.x - from.x, to.y - from.y);
+    const n = Math.max(1, Math.ceil(dist / (R * 0.12)));
+    mctx.globalCompositeOperation = 'source-over';
+    for (let j = 1; j <= n; j++) {
+      const f = j / n;
+      const x = from.x + (to.x - from.x) * f, y = from.y + (to.y - from.y) * f;
+      const press = 0.9 + Math.sin((wipe.t + f * 0.016) * 7 + wipe.seed) * 0.1;  // 押し付けの強弱
+      const rx = R * 1.15 * press, ry = R * press;
+      mctx.save();
+      mctx.translate(x, y);
+      mctx.rotate(to.ang);
+      mctx.globalAlpha = 0.55;
+      mctx.drawImage(rag, -rx, -ry, rx * 2, ry * 2);
+      mctx.restore();
+    }
+    mctx.globalAlpha = 1;
+  }
+
+  /* ── メインループ ── */
+  let last = performance.now(), time = 0, tileX = 0, tileY = 0, sharpDirty = false;
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now; time += dt;
+    const speed = reduce ? 0.35 : 1;
+
+    // マウス速度は時間とともに収まる
+    const md = Math.exp(-dt * 2.2);
+    mouse.vx *= md; mouse.vy *= md;
+
+    /* 1) 霧のベース：画面全体を覆う湯気の膜 */
+    fctx.globalCompositeOperation = 'source-over';
+    fctx.clearRect(0, 0, fw, fh);
+    fctx.fillStyle = `rgba(${FOG_RGB},0.40)`;
+    fctx.fillRect(0, 0, fw, fh);
+
+    // ゆっくり流れる雲のムラ
+    tileY -= fh * 0.018 * dt * speed;
+    tileX += Math.sin(time * 0.13) * fw * 0.006 * dt * speed;
+    const T = Math.max(fw, fh) * 0.9;
+    fctx.globalAlpha = 1;
+    fillPattern(fctx, cloudPat, 256, T, tileX % T, tileY % T, fw, fh);
+
+    /* 2) もくもく立ちのぼる湯気 */
+    const R = Math.min(fw, fh) * 0.42;
+    for (let i = 0; i < puffs.length; i++) {
+      const p = puffs[i];
+      p.age += dt * speed;
+      if (mouse.active || Math.abs(mouse.vx) + Math.abs(mouse.vy) > 1) {
+        const dx = p.x - mouse.x, dy = p.y - mouse.y;
+        const inf = Math.exp(-(dx * dx + dy * dy) / (R * R));
+        // カーソルの動きにゆったり引っ張られる
+        p.vx += (mouse.vx * 0.55 - p.vx) * inf * dt * 1.6;
+        p.vy += (mouse.vy * 0.55 - p.vy) * inf * dt * 1.6;
+        // わずかにカーソルへ寄っていく
+        if (mouse.active) { p.vx -= dx * inf * dt * 0.35; p.vy -= dy * inf * dt * 0.35; }
+      }
+      const damp = Math.exp(-dt * 0.7);
+      p.vx *= damp; p.vy *= damp;
+      p.x += (p.vx + Math.sin(time * p.freq + p.ph) * p.sway) * dt * speed;
+      p.y += (p.vy - p.rise) * dt * speed;
+      p.rot += p.spin * dt * speed;
+
+      const u = p.age / p.life;
+      if (u >= 1 || p.y < -p.r * 1.3 || p.x < -p.r * 2 || p.x > fw + p.r * 2) { puffs[i] = newPuff(false); continue; }
+      const env = Math.sin(Math.PI * Math.min(1, u)) ** 0.7;
+      const size = p.r * (1 + u * 0.7) * 2;
+      fctx.globalAlpha = env * p.a;
+      fctx.save();
+      fctx.translate(p.x, p.y);
+      fctx.rotate(p.rot);
+      fctx.drawImage(p.sp, -size / 2, -size / 2, size, size);
+      fctx.restore();
+    }
+    fctx.globalAlpha = 1;
+
+    /* 3) ぞうきんで拭った跡のマスク */
+    if (wipe.on) {
+      // フレームが落ちても実時間どおりに進める（取りこぼしはstampRagが補間）
+      const tPrev = wipe.t;
+      wipe.t = Math.min((now - wipe.start) / 1000, wipe.dur);
+      // 角をショートカットしないよう、経過時間を細かく刻んで軌跡に沿って拭く
+      const steps = Math.max(1, Math.ceil((wipe.t - tPrev) / (1 / 120)));
+      for (let k = 1; k <= steps; k++) {
+        const pos = ragPos(tPrev + (wipe.t - tPrev) * k / steps);
+        stampRag(wipe.prev, pos);
+        wipe.prev = pos;
+      }
+      if (wipe.t >= wipe.dur) {
+        wipe.on = false; wipe.endedAt = time;
+        btn.removeAttribute('aria-busy');
+      }
+    }
+    // すぐに曇り直す：ムラのある侵食で湯気が戻ってくる
+    const since = time - wipe.endedAt;
+    const erodeRate = wipe.on ? 0.45 : (since < 0.25 ? 0.4 : 1.25);
+    if (since > 0 || wipe.on) {
+      mctx.globalCompositeOperation = 'destination-out';
+      const E = Math.max(fw, fh) * 0.6;
+      mctx.globalAlpha = Math.min(1, dt * erodeRate * 1.4);
+      fillPattern(mctx, erodePat, 128, E, -Math.random() * E, -Math.random() * E, fw, fh);
+      mctx.globalAlpha = Math.min(1, dt * erodeRate * 0.55);
+      mctx.fillStyle = '#000';
+      mctx.fillRect(0, 0, fw, fh);
+      mctx.globalAlpha = 1;
+      if (!wipe.on && since > 4.5) mctx.clearRect(0, 0, fw, fh);  // 8bit丸めの残りを掃除
+    }
+    mctx.globalCompositeOperation = 'source-over';
+
+    fctx.globalCompositeOperation = 'destination-out';
+    fctx.drawImage(mask, 0, 0);
+    fctx.globalCompositeOperation = 'source-over';
+
+    // 拭った所だけ、くっきりしたロゴを見せる
+    const maskLive = wipe.on || since < 4.6;
+    if (maskLive || sharpDirty) {
+      sctx.globalCompositeOperation = 'source-over';
+      sctx.clearRect(0, 0, sharp.width, sharp.height);
+      if (maskLive) {
+        sctx.drawImage(mask, 0, 0, sharp.width, sharp.height);
+        sctx.globalCompositeOperation = 'source-in';
+        sctx.drawImage(sharpBuf, 0, 0);
+        sctx.globalCompositeOperation = 'source-over';
+      }
+      sharpDirty = maskLive;
+    }
+
+    requestAnimationFrame(frame);
+  }
+
+  addEventListener('resize', resize);
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
